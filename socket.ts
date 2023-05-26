@@ -47,6 +47,10 @@ function clearUserInfo(socket: Socket) {
     if (socket.connected) {
         socket.disconnect();
     }
+
+    idSocket.forEach((value, key) => {
+        value.emit("userOffline", id);
+    });
 }
 
 function checkJwt(params: any, socket: Socket) {
@@ -76,7 +80,26 @@ socket.on('connection', (socket) => {
 
         console.log(`CONNECT ID: ${id}`);
 
+        idSocket.forEach((value, key) => {
+            value.emit("userOnline", id);
+        });
+
         cacheUserInfo(socket, id);
+    });
+
+    socket.on('newRoomCreated', (params) => {
+        const roomId = params.roomId;
+        const socketMembersIds: string[] = params.socketMembersIds;
+
+        console.log(roomId, socketMembersIds);
+
+        socketMembersIds.forEach(id => {
+            const recipient = idSocket.get(id);
+
+            if (recipient) {
+                recipient.emit('newRoomCreated', roomId);
+            }
+        });
     });
 
     socket.on('sendMessage', (params) => {
@@ -85,10 +108,9 @@ socket.on('connection', (socket) => {
         const message_text = params.message_text;
         const send_from_id = params.send_from_id;
         const send_to_id = params.send_to_id;
-        const is_read = false;
 
         pool.query(`INSERT INTO message (send_from_id, send_to_id, is_read, message_text) 
-            VALUES (?, ?, ?, ?)`, [send_from_id, send_to_id, is_read, message_text]).then(result => {
+            VALUES (?, ?, ?, ?)`, [send_from_id, send_to_id, false, message_text]).then(result => {
 
             const insert = result[0] as any;
 
@@ -98,10 +120,10 @@ socket.on('connection', (socket) => {
 
                     socket.emit('message', message);
 
-                    const otherSocket = getSocket(message.send_to_id);
+                    let recipient = getSocket(message.send_to_id);
 
-                    if (otherSocket) {
-                        otherSocket.emit('message', message);
+                    if (recipient) {
+                        recipient.emit('message', message);
                     }
 
                     pool.query(`
@@ -121,7 +143,9 @@ socket.on('connection', (socket) => {
                         socket.emit('changeLastMessage', lastMessageInfoToSendingSocket);
                     });
 
-                    if (otherSocket) {
+                    recipient = getSocket(message.send_to_id);
+
+                    if (recipient) {
                         pool.query(`
                         SELECT count(*) as unread_messages_amount_geting_socket FROM message WHERE send_from_id=? AND send_to_id=? AND is_read=FALSE`,
                             [message.send_from_id, message.send_to_id]).then(result => {
@@ -136,12 +160,203 @@ socket.on('connection', (socket) => {
                                 toSendingSocket: false,
                             };
 
-                            otherSocket.emit('changeLastMessage', lastMessageInfoToGetingSocket);
+                            // @ts-ignore
+                            recipient.emit('changeLastMessage', lastMessageInfoToGetingSocket);
                         });
                     }
                 });
             }
         });
+    });
+
+    socket.on('sendRoomMessage', (params) => {
+        checkJwt(params, socket);
+
+        const sendFromId = params.sendFromId;
+        const roomId = params.roomId;
+        const messageText = params.messageText;
+
+        pool.getConnection()
+            .then(conn => {
+                conn.beginTransaction()
+                    .then(() => {
+                        conn.query(`
+                        INSERT INTO message (
+                            message_text,
+                            room_id,
+                            send_from_id,
+                            is_read
+                        ) VALUES (
+                            ?, ?, ?, false
+                        )`, [messageText, roomId, sendFromId])
+                            .then(messageResult => {
+
+                                const messageId = (messageResult[0] as any).insertId;
+
+                                if (messageId) {
+                                    conn.query(`SELECT user_id FROM room_member WHERE room_id=? AND user_id != ?`, [roomId, sendFromId])
+                                        .then(membersResult => {
+                                            const members = (membersResult[0] as any);
+
+                                            const membersPromise: Promise<any>[] = [];
+
+                                            members.forEach((member : {user_id: string}) => {
+                                                membersPromise.push(conn.query(`INSERT INTO unread_message_by (
+                                                    unread_by,
+                                                    message_id,
+                                                    room_id
+                                                ) VALUES (
+                                                    ?, ?, ?
+                                                )`, [member.user_id, messageId, roomId]));
+                                            })
+
+                                            Promise.all(membersPromise)
+                                                .then(result => {
+
+                                                    conn.query(`
+                                                    SELECT 
+                                                        m.message_text,
+                                                        m.message_text as last_message,
+                                                        m.timestamp,
+                                                        m.id,
+                                                        m.is_read,
+                                                        m.send_from_id,
+                                                        m.room_id
+                                                    FROM message m 
+                                                    WHERE m.id=?`, [messageId])
+                                                        .then(result => {
+
+                                                            const message = (result[0] as any)[0];
+
+                                                            members.forEach((member: {user_id: string}) => {
+                                                                const recipient = idSocket.get(member.user_id);
+
+                                                                conn.query(`SELECT count(*) as unreadMessagesAmount FROM unread_message_by WHERE room_id=? AND unread_by=?`, [roomId, member.user_id])
+                                                                    .then(result => {
+                                                                        const unreadAmount = (result[0] as any)[0].unreadMessagesAmount;
+
+                                                                        if (recipient) {
+                                                                            const res = {
+                                                                                roomId,
+                                                                                unreadMessagesAmount: unreadAmount
+                                                                            };
+
+                                                                            recipient.emit('changeUnreadRoomMessagesAmount', res);
+                                                                        }
+
+                                                                        conn.commit();
+
+                                                                        conn.release();
+                                                                    })
+                                                                    .catch(err => {
+                                                                        console.log(err);
+                                                                    })
+
+                                                                if (recipient) {
+                                                                    recipient.emit('roomMessageSend', message);
+                                                                    recipient.emit('changeLastRoomMessage', message);
+                                                                }
+                                                            });
+
+                                                            socket.emit('roomMessageSend', message);
+                                                            socket.emit('changeLastRoomMessage', message);
+                                                        })
+                                                        .catch(err => {
+                                                            console.log(err);
+
+                                                            conn.rollback();
+
+                                                            conn.release();
+                                                        })
+                                                })
+                                                .catch(err => {
+                                                    console.log(err);
+
+                                                    conn.rollback();
+
+                                                    conn.release();
+                                                })
+                                        })
+                                        .catch(err => {
+                                            console.log(err);
+
+                                            conn.rollback();
+
+                                            conn.release();
+                                        })
+                                } else {
+                                    // сообщение не добавлено
+                                    conn.rollback();
+
+                                    conn.release();
+                                }
+                            })
+                            .catch(err => {
+                                console.log(err);
+
+                                conn.rollback();
+
+                                conn.release();
+                            })
+                    })
+                    .catch(err => {
+                        conn.rollback();
+
+                        conn.release();
+                    })
+            })
+            .catch(err => {
+
+            });
+    });
+
+    socket.on('roomMessageRead', (params) => {
+        const messageId = params.messageId;
+        const roomId = params.roomId;
+        const readByUserId = params.sendFromId;
+        const msgSendFromId = params.msgSendFromId;
+
+        pool.query(`DELETE FROM unread_message_by WHERE unread_by=? AND message_id=? AND room_id=?`, [readByUserId, messageId, roomId])
+            .then(result => {
+                pool.query(`UPDATE message SET is_read=true WHERE id=?`, messageId)
+                    .then(result => {
+                        socket.emit('readRoomMessage', messageId);
+
+                        const recipient = idSocket.get(msgSendFromId);
+
+                        if (recipient) {
+                            pool.query(`
+                                SELECT
+                                    count(*) as unreadMessagesAmount
+                                FROM unread_message_by WHERE room_id=? AND unread_by=?`, [roomId, readByUserId])
+                            .then(result => {
+                                recipient.emit('readRoomMessage', messageId);
+
+                                const unreadAmount = (result[0] as any)[0].unreadMessagesAmount;
+
+                                const res = {
+                                    roomId,
+                                    unreadMessagesAmount: unreadAmount
+                                };
+
+                                const readSocket = idSocket.get(readByUserId);
+
+                                if (readSocket) {
+                                    readSocket.emit('changeUnreadRoomMessagesAmount', res);
+                                }
+                            })
+                            .catch(err => {
+                                console.log(err);
+                            });
+                        }
+                    })
+                    .catch(err => {
+                        console.log(err)
+                    })
+            })
+            .catch(err => {
+                console.log(err)
+            });
     });
 
     socket.on('allMessagesRead', (params) => {
@@ -150,17 +365,17 @@ socket.on('connection', (socket) => {
         const {otherUserId} = params;
         const authUserId = socketId.get(socket);
 
-        pool.query(`UPDATE message SET is_read=TRUE WHERE send_to_id=? AND send_From_id=? AND is_read=FALSE`, [authUserId, otherUserId]).then(result => {
+        pool.query(`UPDATE message SET is_read=TRUE WHERE send_to_id=? AND send_from_id=? AND is_read=FALSE`, [authUserId, otherUserId]).then(result => {
             socket.emit('allMessagesRead', {
                 toSendSocket: true,
                 otherUserId: otherUserId,
                 authUserId: authUserId,
             });
 
-            const otherSocket = idSocket.get(otherUserId);
+            const recipient = idSocket.get(otherUserId);
 
-            if (otherSocket) {
-                otherSocket.emit('allMessagesRead', {
+            if (recipient) {
+                recipient.emit('allMessagesRead', {
                     toSendSocket: false,
                     otherUserId: authUserId,
                     authUserId: otherUserId
