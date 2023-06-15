@@ -91,8 +91,6 @@ socket.on('connection', (socket) => {
         const roomId = params.roomId;
         const socketMembersIds: string[] = params.socketMembersIds;
 
-        console.log(roomId, socketMembersIds);
-
         socketMembersIds.forEach(id => {
             const recipient = idSocket.get(id);
 
